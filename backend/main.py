@@ -5,6 +5,8 @@ from typing import Literal
 from pathlib import Path
 import subprocess
 import heapq
+import time
+import random
 
 app = FastAPI(title="RouteIQ API", version="1.0.0")
 
@@ -22,7 +24,12 @@ app.add_middleware(
 
 GRID_SIZE = 15
 BASE_DIR = Path(__file__).resolve().parent
-ALGORITHM_EXECUTABLE = BASE_DIR / "algorithm.exe"
+
+# Check for Windows .exe or POSIX executable binary
+if (BASE_DIR / "algorithm.exe").exists():
+    ALGORITHM_EXECUTABLE = BASE_DIR / "algorithm.exe"
+else:
+    ALGORITHM_EXECUTABLE = BASE_DIR / "algorithm"
 
 # --------------------------------------------------
 # MODELS
@@ -51,8 +58,12 @@ class RouteRequest(BaseModel):
     stops: list[Point] = Field(default_factory=list)
 
 
+class BenchmarkRequest(BaseModel):
+    stop_counts: list[int] = Field(default=[5, 10, 15, 20])
+
+
 # --------------------------------------------------
-# DATA
+# IN-MEMORY DATA STORE
 # --------------------------------------------------
 
 drivers = [
@@ -62,7 +73,6 @@ drivers = [
 ]
 
 orders = []
-# Obstacles are stored as (x, y) tuples.
 obstacles: set[tuple[int, int]] = set()
 next_order_id = 1
 
@@ -110,7 +120,7 @@ def run_cpp_algorithm(origin, destination, stops=None):
     destination = point_dict(destination)
     stops = [point_dict(stop) for stop in (stops or [])]
 
-    # Exclude duplicate stops and the start/end coordinates.
+    # Exclude duplicate stops and endpoints
     seen = {point_key(origin), point_key(destination)}
     filtered_stops = []
     for stop in stops:
@@ -132,7 +142,7 @@ def run_cpp_algorithm(origin, destination, stops=None):
     if not ALGORITHM_EXECUTABLE.exists():
         raise HTTPException(
             status_code=500,
-            detail="algorithm.exe not found. Compile backend/algorithm.cpp first.",
+            detail="Compiled route algorithm binary not found. Compile backend/algorithm.cpp first.",
         )
 
     try:
@@ -188,10 +198,11 @@ def run_cpp_algorithm(origin, destination, stops=None):
 
 
 # --------------------------------------------------
-# DRIVER ASSIGNMENT
+# DRIVER MANAGEMENT
 # --------------------------------------------------
 
 def assign_driver(payload):
+    """Greedy best-fit: smallest available capacity >= payload."""
     eligible = [
         driver for driver in drivers
         if driver["available"] and driver["capacity"] >= payload
@@ -199,7 +210,6 @@ def assign_driver(payload):
     if not eligible:
         return None
 
-    # Greedy best-fit: smallest available capacity that fits the payload.
     eligible.sort(key=lambda driver: driver["capacity"])
     selected = eligible[0]
     selected["available"] = False
@@ -215,7 +225,7 @@ def release_driver(driver_id):
 
 
 # --------------------------------------------------
-# HEALTH
+# HEALTH & STATE
 # --------------------------------------------------
 
 @app.get("/api/health")
@@ -223,13 +233,9 @@ def health():
     return {
         "status": "running",
         "service": "RouteIQ",
-        "algorithm": "C++ Dijkstra + bitmask DP multi-stop optimizer",
+        "algorithm": "C++ Dijkstra + Bitmask DP / 2-Opt Heuristics",
     }
 
-
-# --------------------------------------------------
-# DASHBOARD STATE
-# --------------------------------------------------
 
 @app.get("/api/state")
 def get_state():
@@ -282,11 +288,10 @@ def create_order(request: CreateOrderRequest):
 
     if point_key(origin) in obstacles or point_key(destination) in obstacles:
         raise HTTPException(status_code=400, detail="Origin or destination is blocked by an obstacle.")
-        
+
     if any(point_key(stop) in obstacles for stop in stops):
         raise HTTPException(status_code=400, detail="One or more stops are blocked by an obstacle.")
 
-    # Calculate this order's routed path through all stops.
     route_result = run_cpp_algorithm(origin, destination, stops)
     shortest_route = route_result["shortest_route"]
 
@@ -327,7 +332,40 @@ def create_order(request: CreateOrderRequest):
 
 
 # --------------------------------------------------
-# ROUTE CALCULATION — MULTI-STOP
+# GREEDY AUTO-DISPATCH (FLEET ASSIGNMENT)
+# --------------------------------------------------
+
+@app.post("/api/dispatch/auto-assign")
+def auto_assign_orders():
+    """
+    Assign pending orders using priority ranking (Critical -> High -> Medium -> Low).
+    Matches each order with the best available driver capacity.
+    """
+    pending = [o for o in orders if o["status"] == "Pending"]
+    if not pending:
+        return {"message": "No pending orders to assign.", "assigned_count": 0}
+
+    # Sort orders by urgency first, then payload size
+    pending.sort(key=lambda o: (PRIORITY_RANK[o["priority"]], -o["payload"]))
+
+    assigned_count = 0
+    for order in pending:
+        driver = assign_driver(order["payload"])
+        if driver:
+            order["status"] = "Assigned"
+            order["driver"] = driver["name"]
+            order["driver_id"] = driver["id"]
+            driver["current_order"] = order["id"]
+            assigned_count += 1
+
+    return {
+        "message": f"Successfully auto-assigned {assigned_count} orders via greedy dispatch.",
+        "assigned_count": assigned_count,
+    }
+
+
+# --------------------------------------------------
+# ROUTE CALCULATION & COMPARISON
 # --------------------------------------------------
 
 @app.post("/api/route")
@@ -350,10 +388,6 @@ def calculate_route(request: RouteRequest):
         "stops_count": len(stops),
     }
 
-
-# --------------------------------------------------
-# ROUTE COMPARISON
-# --------------------------------------------------
 
 @app.post("/api/route/compare")
 def compare_routes(request: RouteRequest):
@@ -384,7 +418,7 @@ def compare_routes(request: RouteRequest):
         "stops_count": len(stops),
         "distance_difference": difference,
         "recommendation": (
-            "Shortest route is more efficient"
+            "Shortest route is optimal"
             if result["alternative_route"]
             else "No alternate route available"
         ),
@@ -392,7 +426,46 @@ def compare_routes(request: RouteRequest):
 
 
 # --------------------------------------------------
-# UPDATE DELIVERY STATUS
+# SCALABILITY / BENCHMARK ENDPOINT
+# --------------------------------------------------
+
+@app.post("/api/benchmark")
+def run_benchmark(request: BenchmarkRequest):
+    """
+    Benchmarks TSP computation time across various stop counts.
+    Demonstrates NP-hard scaling (DP for small N vs Heuristics for large N).
+    """
+    benchmarks = []
+    origin = {"x": 0, "y": 0}
+    destination = {"x": 14, "y": 14}
+
+    for count in request.stop_counts:
+        # Generate random unique stop points
+        sample_stops = []
+        occupied = {(0, 0), (14, 14)} | obstacles
+
+        while len(sample_stops) < min(count, 50):
+            p = (random.randint(0, 14), random.randint(0, 14))
+            if p not in occupied:
+                occupied.add(p)
+                sample_stops.append({"x": p[0], "y": p[1]})
+
+        start_time = time.perf_counter()
+        result = run_cpp_algorithm(origin, destination, sample_stops)
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+
+        benchmarks.append({
+            "stops": len(sample_stops),
+            "algorithm": "Bitmask DP" if len(sample_stops) <= 12 else "2-Opt Heuristic",
+            "distance": result["shortest_distance"],
+            "execution_time_ms": duration_ms,
+        })
+
+    return {"benchmarks": benchmarks}
+
+
+# --------------------------------------------------
+# UPDATE STATUS & LIFECYCLE
 # --------------------------------------------------
 
 @app.patch("/api/orders/{order_id}/status")
@@ -443,7 +516,6 @@ def update_order_status(
 def update_obstacles(request: ObstacleRequest):
     new_obstacles = {(cell.x, cell.y) for cell in request.cells}
 
-    # Do not block endpoints or waypoints of orders currently assigned or in transit.
     for order in orders:
         if order["status"] in ["Assigned", "In Transit"]:
             order_stops = order.get("stops", [])
@@ -460,11 +532,9 @@ def update_obstacles(request: ObstacleRequest):
     obstacles.clear()
     obstacles.update(new_obstacles)
 
-    # Recalculate individual stored routes after obstacle updates.
     for order in orders:
         if order["status"] in ["Pending", "Assigned"]:
             result = run_cpp_algorithm(order["origin"], order["destination"], order.get("stops", []))
-
             if not result["shortest_route"]:
                 order["route"] = []
                 order["distance"] = None
@@ -493,4 +563,4 @@ def clear_orders():
         driver["available"] = True
         driver["current_order"] = None
 
-    return {"message": "All orders cleared.", "orders": []}
+    return {"message": "All orders cleared and driver fleet reset.", "orders": []}
