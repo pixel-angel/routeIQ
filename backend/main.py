@@ -7,6 +7,7 @@ import subprocess
 import heapq
 import time
 import random
+import math
 
 app = FastAPI(title="RouteIQ API", version="1.0.0")
 
@@ -59,7 +60,7 @@ class RouteRequest(BaseModel):
 
 
 class BenchmarkRequest(BaseModel):
-    stop_counts: list[int] = Field(default=[5, 10, 15, 20])
+    stop_counts: list[int] = Field(default=[5, 10, 50, 100])
 
 
 # --------------------------------------------------
@@ -95,7 +96,8 @@ def point_key(point):
 
 
 def collect_active_order_stops(exclude_order_id=None):
-    """Unique destinations for active orders, sorted by urgency then order ID."""
+    """Every delivery point (intermediate stops + destination) of active orders,
+    sorted by urgency then order ID."""
     active = [
         order for order in orders
         if order["id"] != exclude_order_id
@@ -106,37 +108,38 @@ def collect_active_order_stops(exclude_order_id=None):
     stops = []
     seen = set()
     for order in active:
-        destination = order["destination"]
-        key = point_key(destination)
-        if key not in seen:
-            seen.add(key)
-            stops.append(destination)
+        points = order.get("stop_sequence") or order.get("stops", [])
+        for point in [*points, order["destination"]]:
+            key = point_key(point)
+            if key not in seen:
+                seen.add(key)
+                stops.append(point_dict(point))
     return stops
 
 
-def run_cpp_algorithm(origin, destination, stops=None):
-    """Pass start, endpoint, intermediate order stops and obstacles to C++."""
-    origin = point_dict(origin)
-    destination = point_dict(destination)
-    stops = [point_dict(stop) for stop in (stops or [])]
-
-    # Exclude duplicate stops and endpoints
+def dedupe_stops(origin, destination, stops):
+    """Drop stops that repeat each other or coincide with the origin/destination."""
     seen = {point_key(origin), point_key(destination)}
-    filtered_stops = []
+    filtered = []
     for stop in stops:
         key = point_key(stop)
         if key not in seen:
             seen.add(key)
-            filtered_stops.append(stop)
+            filtered.append(point_dict(stop))
+    return filtered
 
+
+def call_engine(origin, destination, stops, mode="route", blocked=None):
+    """Run the C++ engine and return its stdout tokens."""
+    blocked = obstacles if blocked is None else blocked
     lines = [
         f"{origin['x']} {origin['y']}",
         f"{destination['x']} {destination['y']}",
-        str(len(filtered_stops)),
+        str(len(stops)),
     ]
-    lines.extend(f"{stop['x']} {stop['y']}" for stop in filtered_stops)
-    lines.append(str(len(obstacles)))
-    lines.extend(f"{x} {y}" for x, y in sorted(obstacles))
+    lines.extend(f"{stop['x']} {stop['y']}" for stop in stops)
+    lines.append(str(len(blocked)))
+    lines.extend(f"{x} {y}" for x, y in sorted(blocked))
     input_data = "\n".join(lines) + "\n"
 
     if not ALGORITHM_EXECUTABLE.exists():
@@ -145,14 +148,18 @@ def run_cpp_algorithm(origin, destination, stops=None):
             detail="Compiled route algorithm binary not found. Compile backend/algorithm.cpp first.",
         )
 
+    args = [str(ALGORITHM_EXECUTABLE)]
+    if mode != "route":
+        args.append(mode)
+
     try:
         result = subprocess.run(
-            [str(ALGORITHM_EXECUTABLE)],
+            args,
             input=input_data,
             text=True,
             capture_output=True,
             check=True,
-            timeout=10,
+            timeout=30,
         )
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=500, detail="C++ route algorithm timed out.")
@@ -161,39 +168,148 @@ def run_cpp_algorithm(origin, destination, stops=None):
             status_code=500,
             detail=error.stderr.strip() or "C++ route algorithm failed.",
         )
+    return result.stdout.split()
 
-    output = result.stdout.split()
-    index = 0
-    routes = []
 
+class TokenReader:
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.index = 0
+
+    def done(self):
+        return self.index >= len(self.tokens)
+
+    def next(self):
+        value = self.tokens[self.index]
+        self.index += 1
+        return value
+
+    def int(self):
+        return int(self.next())
+
+    def path(self):
+        if self.done():
+            return []
+        return [{"x": self.int(), "y": self.int()} for _ in range(self.int())]
+
+    def order(self):
+        if self.done():
+            return []
+        return [self.int() for _ in range(self.int())]
+
+
+def run_cpp_algorithm(origin, destination, stops=None):
+    """Plan the best route origin -> all stops -> destination (Dijkstra + DP / 2-opt)."""
+    origin = point_dict(origin)
+    destination = point_dict(destination)
+    filtered_stops = dedupe_stops(origin, destination, stops or [])
+
+    reader = TokenReader(call_engine(origin, destination, filtered_stops))
     try:
-        for _ in range(2):
-            if index >= len(output):
-                routes.append([])
-                continue
-
-            count = int(output[index])
-            index += 1
-            route = []
-
-            for _ in range(count):
-                x = int(output[index])
-                y = int(output[index + 1])
-                index += 2
-                route.append({"x": x, "y": y})
-
-            routes.append(route)
+        shortest = reader.path()
+        alternative = reader.path()
+        visit_order = reader.order()
     except (ValueError, IndexError):
         raise HTTPException(status_code=500, detail="Invalid output from C++ route algorithm.")
-
-    shortest = routes[0] if routes else []
-    alternative = routes[1] if len(routes) > 1 else []
 
     return {
         "shortest_route": shortest,
         "alternative_route": alternative,
         "shortest_distance": len(shortest) - 1 if shortest else None,
         "alternative_distance": len(alternative) - 1 if alternative else None,
+        # Stops in the order the driver actually visits them
+        "stop_sequence": [filtered_stops[i] for i in visit_order if 0 <= i < len(filtered_stops)],
+    }
+
+
+STRATEGY_INFO = {
+    "input_order": {
+        "label": "Input order (FIFO)",
+        "family": "Baseline",
+        "complexity": "O(n)",
+        "description": "Visits stops in the order they were queued. No optimisation.",
+    },
+    "nearest_neighbor": {
+        "label": "Greedy nearest neighbour",
+        "family": "Greedy heuristic",
+        "complexity": "O(n²)",
+        "description": "Always drives to the closest unvisited stop. Fast but can be short-sighted.",
+    },
+    "two_opt": {
+        "label": "2-opt + Or-opt local search",
+        "family": "TSP heuristic",
+        "complexity": "O(k·n³)",
+        "description": "Starts from the greedy tour, then reverses segments and relocates stop chains while that shortens it.",
+    },
+    "held_karp": {
+        "label": "Held-Karp bitmask DP",
+        "family": "Dynamic programming (exact)",
+        "complexity": "O(2ⁿ·n²)",
+        "description": "Guaranteed optimal. Memory and time double with every extra stop.",
+    },
+    "brute_force": {
+        "label": "Brute force permutations",
+        "family": "Exhaustive search (exact)",
+        "complexity": "O(n!)",
+        "description": "Tries every possible visiting order. Only feasible for a handful of stops.",
+    },
+}
+EXACT_STRATEGIES = {"held_karp", "brute_force"}
+
+
+def run_cpp_comparison(origin, destination, stops, blocked=None):
+    """Run every routing strategy on the same instance and score them against each other."""
+    origin = point_dict(origin)
+    destination = point_dict(destination)
+    filtered_stops = dedupe_stops(origin, destination, stops)
+
+    reader = TokenReader(call_engine(origin, destination, filtered_stops, "compare", blocked))
+    strategies = []
+    try:
+        while not reader.done():
+            if reader.next() != "STRATEGY":
+                raise ValueError("expected STRATEGY")
+            key = reader.next()
+            status = reader.next()
+            distance = reader.int()
+            time_ns = reader.int()
+            work = reader.int()
+            order = reader.order()
+            route = reader.path()
+            strategies.append({
+                "key": key,
+                **STRATEGY_INFO.get(key, {"label": key}),
+                "status": status,
+                "exact": key in EXACT_STRATEGIES,
+                "distance": distance if status == "ok" else None,
+                "time_ms": round(time_ns / 1e6, 4),
+                "operations": work,
+                "stop_sequence": [filtered_stops[i] for i in order if 0 <= i < len(filtered_stops)],
+                "route": route,
+            })
+    except (ValueError, IndexError):
+        raise HTTPException(status_code=500, detail="Invalid output from C++ comparison engine.")
+
+    solved = [s for s in strategies if s["distance"] is not None]
+    exact = [s for s in solved if s["exact"]]
+    best_distance = min((s["distance"] for s in solved), default=None)
+    optimal_known = bool(exact) or len(filtered_stops) <= 1
+
+    for s in strategies:
+        s["gap_percent"] = (
+            round((s["distance"] - best_distance) / best_distance * 100, 1)
+            if s["distance"] is not None and best_distance
+            else (0.0 if s["distance"] is not None else None)
+        )
+
+    return filtered_stops, strategies, best_distance, optimal_known
+
+
+def search_space(n):
+    """Size of the problem each exact method has to explore for n stops."""
+    return {
+        "permutations": str(math.factorial(n)) if n <= 20 else f"{math.factorial(n):.2e}",
+        "dp_states": (2 ** n) * n * n if n <= 30 else f"{float(2 ** n) * n * n:.2e}",
     }
 
 
@@ -320,6 +436,7 @@ def create_order(request: CreateOrderRequest):
         "driver_id": driver_id,
         "distance": route_result["shortest_distance"],
         "route": shortest_route,
+        "stop_sequence": route_result["stop_sequence"],
         "created_at": next_order_id,
     }
 
@@ -391,37 +508,68 @@ def calculate_route(request: RouteRequest):
 
 @app.post("/api/route/compare")
 def compare_routes(request: RouteRequest):
+    """
+    Solve the same delivery instance with every strategy (baseline, greedy,
+    2-opt, Held-Karp DP, brute force) and compare distance, runtime and work.
+    """
     origin = request.origin.model_dump()
     destination = request.destination.model_dump()
 
     stops = [stop.model_dump() for stop in request.stops]
+    source = "planner"
     if not stops:
         stops = collect_active_order_stops()
+        source = "active_orders"
 
-    result = run_cpp_algorithm(origin, destination, stops)
+    filtered_stops, strategies, best_distance, optimal_known = run_cpp_comparison(
+        origin, destination, stops
+    )
 
-    if not result["shortest_route"]:
+    if best_distance is None:
         raise HTTPException(status_code=404, detail="No valid route found through all delivery stops.")
 
-    shortest_distance = result["shortest_distance"]
-    alternative_distance = result["alternative_distance"]
-
-    difference = (
-        alternative_distance - shortest_distance
-        if alternative_distance is not None and shortest_distance is not None
+    solved = [s for s in strategies if s["distance"] is not None]
+    # Best = shortest distance; ties go to the fastest strategy
+    best = min(solved, key=lambda s: (s["distance"], s["time_ms"]))
+    baseline = next((s for s in strategies if s["key"] == "input_order"), None)
+    savings = (
+        baseline["distance"] - best["distance"]
+        if baseline and baseline["distance"] is not None
         else None
     )
 
+    n = len(filtered_stops)
+    if n == 0:
+        recommendation = "No delivery stops: direct Dijkstra shortest path is optimal."
+    elif optimal_known:
+        recommendation = (
+            f"{best['label']} gives the optimal tour of {best['distance']} units"
+            + (f", saving {savings} units vs input order." if savings else ".")
+        )
+    else:
+        recommendation = (
+            f"{n} stops is too many for exact search; {best['label']} is the best "
+            f"heuristic tour ({best['distance']} units)"
+            + (f", saving {savings} units vs input order." if savings else ".")
+        )
+
     return {
-        **result,
-        "stops": stops,
-        "stops_count": len(stops),
-        "distance_difference": difference,
-        "recommendation": (
-            "Shortest route is optimal"
-            if result["alternative_route"]
-            else "No alternate route available"
-        ),
+        "stops": filtered_stops,
+        "stops_count": n,
+        "stops_source": source,
+        "strategies": strategies,
+        "best_strategy": best["key"],
+        "best_distance": best_distance,
+        "optimal_known": optimal_known,
+        "savings_vs_input_order": savings,
+        "search_space": search_space(n),
+        "recommendation": recommendation,
+        # Map overlay: optimised route vs the naive (input order) route
+        "shortest_route": best["route"],
+        "shortest_distance": best["distance"],
+        "alternative_route": baseline["route"] if baseline else [],
+        "alternative_distance": baseline["distance"] if baseline else None,
+        "distance_difference": savings,
     }
 
 
@@ -432,33 +580,45 @@ def compare_routes(request: RouteRequest):
 @app.post("/api/benchmark")
 def run_benchmark(request: BenchmarkRequest):
     """
-    Benchmarks TSP computation time across various stop counts.
-    Demonstrates NP-hard scaling (DP for small N vs Heuristics for large N).
+    Generate random instances with 5, 10, 50, 100... delivery locations and run
+    every strategy on each, showing how exact methods blow up (n!, 2^n * n^2)
+    while heuristics stay fast but lose the optimality guarantee.
+    Benchmarks run on an obstacle-free grid so every random instance is solvable.
     """
-    benchmarks = []
     origin = {"x": 0, "y": 0}
-    destination = {"x": 14, "y": 14}
+    destination = {"x": GRID_SIZE - 1, "y": GRID_SIZE - 1}
+    free_cells = [
+        (x, y)
+        for x in range(GRID_SIZE)
+        for y in range(GRID_SIZE)
+        if (x, y) not in {(0, 0), (GRID_SIZE - 1, GRID_SIZE - 1)}
+    ]
 
-    for count in request.stop_counts:
-        # Generate random unique stop points
-        sample_stops = []
-        occupied = {(0, 0), (14, 14)} | obstacles
-
-        while len(sample_stops) < min(count, 50):
-            p = (random.randint(0, 14), random.randint(0, 14))
-            if p not in occupied:
-                occupied.add(p)
-                sample_stops.append({"x": p[0], "y": p[1]})
+    rng = random.Random()
+    benchmarks = []
+    for requested in request.stop_counts:
+        count = max(0, min(requested, len(free_cells)))
+        sample = [{"x": x, "y": y} for x, y in rng.sample(free_cells, count)]
 
         start_time = time.perf_counter()
-        result = run_cpp_algorithm(origin, destination, sample_stops)
-        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        _, strategies, best_distance, optimal_known = run_cpp_comparison(
+            origin, destination, sample, blocked=set()
+        )
+        total_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         benchmarks.append({
-            "stops": len(sample_stops),
-            "algorithm": "Bitmask DP" if len(sample_stops) <= 12 else "2-Opt Heuristic",
-            "distance": result["shortest_distance"],
-            "execution_time_ms": duration_ms,
+            "stops": count,
+            "requested_stops": requested,
+            "best_distance": best_distance,
+            "optimal_known": optimal_known,
+            "search_space": search_space(count),
+            "total_ms": total_ms,
+            "strategies": [
+                {key: s[key] for key in (
+                    "key", "label", "status", "distance", "time_ms", "operations", "gap_percent", "exact"
+                )}
+                for s in strategies
+            ],
         })
 
     return {"benchmarks": benchmarks}
@@ -541,6 +701,7 @@ def update_obstacles(request: ObstacleRequest):
             else:
                 order["route"] = result["shortest_route"]
                 order["distance"] = result["shortest_distance"]
+                order["stop_sequence"] = result["stop_sequence"]
 
     return {
         "message": "Obstacles updated.",

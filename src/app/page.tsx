@@ -19,6 +19,7 @@ type Order = {
   driver_id: number | null;
   distance: number | null;
   route: Point[];
+  stop_sequence?: Point[];
 };
 
 type Driver = {
@@ -41,14 +42,77 @@ type State = {
   };
 };
 
+type StrategyResult = {
+  key: string;
+  label: string;
+  family: string;
+  complexity: string;
+  description: string;
+  status: "ok" | "skipped" | "infeasible";
+  exact: boolean;
+  distance: number | null;
+  time_ms: number;
+  operations: number;
+  gap_percent: number | null;
+  stop_sequence: Point[];
+  route: Point[];
+};
+
+type SearchSpace = {
+  permutations: string;
+  dp_states: number | string;
+};
+
 type RouteComparison = {
+  stops: Point[];
+  stops_count: number;
+  stops_source: "planner" | "active_orders";
+  strategies: StrategyResult[];
+  best_strategy: string;
+  best_distance: number | null;
+  optimal_known: boolean;
+  savings_vs_input_order: number | null;
+  search_space: SearchSpace;
+  recommendation: string;
   shortest_route: Point[];
   shortest_distance: number | null;
   alternative_route: Point[];
   alternative_distance: number | null;
-  distance_difference: number | null;
-  recommendation: string;
 };
+
+type BenchmarkRow = {
+  stops: number;
+  requested_stops: number;
+  best_distance: number | null;
+  optimal_known: boolean;
+  search_space: SearchSpace;
+  total_ms: number;
+  strategies: Pick<
+    StrategyResult,
+    | "key"
+    | "label"
+    | "status"
+    | "distance"
+    | "time_ms"
+    | "operations"
+    | "gap_percent"
+    | "exact"
+  >[];
+};
+
+const BENCHMARK_SIZES = [5, 10, 50, 100];
+
+function formatMs(ms: number) {
+  if (ms === 0) return "<0.001 ms";
+  if (ms < 0.01) return `${(ms * 1000).toFixed(1)} µs`;
+  if (ms < 10) return `${ms.toFixed(3)} ms`;
+  return `${ms.toFixed(1)} ms`;
+}
+
+function formatCount(value: number | string) {
+  if (typeof value === "string") return value;
+  return value.toLocaleString();
+}
 
 const initialState: State = {
   orders: [],
@@ -119,6 +183,11 @@ export default function RouteIQDashboard() {
   >("obstacle");
 
   const [comparison, setComparison] = useState<RouteComparison | null>(null);
+  const [selectedStrategy, setSelectedStrategy] = useState<string | null>(
+    null,
+  );
+  const [benchmark, setBenchmark] = useState<BenchmarkRow[] | null>(null);
+  const [benchmarkLoading, setBenchmarkLoading] = useState(false);
 
   const [showAlternative, setShowAlternative] = useState(false);
   const [showObstacles, setShowObstacles] = useState(true);
@@ -275,9 +344,15 @@ export default function RouteIQDashboard() {
       );
 
       setComparison(result);
+      setSelectedStrategy(result.best_strategy);
       setShowAlternative(true);
 
-      notify("Route comparison completed.", "success");
+      notify(
+        result.stops_source === "active_orders"
+          ? `Compared strategies over ${result.stops_count} active order stops.`
+          : `Compared strategies over ${result.stops_count} planner stops.`,
+        "success",
+      );
     } catch (error) {
       notify(
         error instanceof Error ? error.message : "Route comparison failed.",
@@ -285,6 +360,27 @@ export default function RouteIQDashboard() {
       );
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function runBenchmark() {
+    setBenchmarkLoading(true);
+
+    try {
+      const result: { benchmarks: BenchmarkRow[] } = await apiRequest(
+        "/api/benchmark",
+        "POST",
+        { stop_counts: BENCHMARK_SIZES },
+      );
+      setBenchmark(result.benchmarks);
+      notify("Scalability benchmark completed.", "success");
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "Benchmark failed.",
+        "error",
+      );
+    } finally {
+      setBenchmarkLoading(false);
     }
   }
 
@@ -385,9 +481,37 @@ export default function RouteIQDashboard() {
     );
   }, [data.orders, origin, destination]);
 
+  const activeStrategy = useMemo(() => {
+    if (!comparison) return null;
+    return (
+      comparison.strategies.find((s) => s.key === selectedStrategy) ??
+      comparison.strategies.find((s) => s.key === comparison.best_strategy) ??
+      null
+    );
+  }, [comparison, selectedStrategy]);
+
   const rawShortestRoute = useMemo(() => {
+    if (activeStrategy && activeStrategy.route.length > 0) {
+      return activeStrategy.route;
+    }
     return comparison?.shortest_route ?? activeOrderRoute;
-  }, [comparison, activeOrderRoute]);
+  }, [comparison, activeStrategy, activeOrderRoute]);
+
+  // Stops shown on the map: the compared instance (may come from active orders) or the planner stops
+  const displayStops = useMemo(() => {
+    return comparison ? comparison.stops : stops;
+  }, [comparison, stops]);
+
+  // Number each stop by its position in the selected strategy's visiting order
+  const visitNumber = useMemo(() => {
+    const map = new Map<string, number>();
+    if (activeStrategy && activeStrategy.stop_sequence.length > 0) {
+      activeStrategy.stop_sequence.forEach((p, i) => map.set(pointKey(p), i + 1));
+    } else {
+      displayStops.forEach((p, i) => map.set(pointKey(p), i + 1));
+    }
+    return map;
+  }, [activeStrategy, displayStops]);
 
   const rawAlternativeRoute = useMemo(() => {
     return comparison?.alternative_route ?? [];
@@ -436,7 +560,7 @@ export default function RouteIQDashboard() {
       return "map-cell obstacle-cell";
     }
 
-    if (stops.some((p) => samePoint(p, point))) {
+    if (displayStops.some((p) => samePoint(p, point))) {
       return "map-cell stop-cell";
     }
 
@@ -761,7 +885,7 @@ export default function RouteIQDashboard() {
                 {Array.from({ length: GRID_SIZE }, (_, y) =>
                   Array.from({ length: GRID_SIZE }, (_, x) => {
                     const point = { x, y };
-                    const stopIdx = stops.findIndex((p) => samePoint(p, point));
+                    const stopNumber = visitNumber.get(pointKey(point));
 
                     return (
                       <button
@@ -778,8 +902,8 @@ export default function RouteIQDashboard() {
                             : showObstacles &&
                                 data.obstacles.some((p) => samePoint(p, point))
                               ? "×"
-                              : stopIdx !== -1
-                                ? (stopIdx + 1).toString()
+                              : stopNumber !== undefined
+                                ? stopNumber.toString()
                                 : ""}
                       </button>
                     );
@@ -796,10 +920,11 @@ export default function RouteIQDashboard() {
                 <i className="legend-destination" /> Destination
               </span>
               <span>
-                <i className="legend-route" /> Shortest route
+                <i className="legend-route" />{" "}
+                {activeStrategy ? activeStrategy.label : "Shortest route"}
               </span>
               <span>
-                <i className="legend-alternative" /> Alternative
+                <i className="legend-alternative" /> Input-order baseline
               </span>
               <span>
                 <i className="legend-stop" /> Delivery Stop
@@ -976,55 +1101,240 @@ export default function RouteIQDashboard() {
           <section className="panel comparison-panel">
             <div className="panel-heading">
               <div>
-                <div className="eyebrow">C++ ROUTE ENGINE</div>
-                <h3>Route Comparison</h3>
+                <div className="eyebrow">
+                  C++ ROUTE ENGINE · {comparison.stops_count} STOPS ·{" "}
+                  {comparison.stops_source === "active_orders"
+                    ? "FROM ACTIVE ORDERS"
+                    : "FROM PLANNER"}
+                </div>
+                <h3>Route Strategy Comparison</h3>
               </div>
-              <button
-                className="small-button"
-                onClick={() => setComparison(null)}
-              >
-                Close
-              </button>
-            </div>
-
-            <div className="comparison-grid">
-              <div className="comparison-card shortest">
-                <span>SHORTEST ROUTE</span>
-                <strong>
-                  {comparison.shortest_distance ?? "—"}
-                  <small> units</small>
-                </strong>
-                <p>Optimized path using Dijkstra</p>
-              </div>
-
-              <div className="comparison-card alternate">
-                <span>ALTERNATIVE ROUTE</span>
-                <strong>
-                  {comparison.alternative_distance ?? "—"}
-                  <small> units</small>
-                </strong>
-                <p>
-                  {comparison.alternative_distance === null
-                    ? "No alternate route found"
-                    : `${comparison.distance_difference ?? 0} units difference`}
-                </p>
-              </div>
-
-              <div className="comparison-card recommendation">
-                <span>RECOMMENDATION</span>
-                <strong>{comparison.recommendation}</strong>
+              <div className="map-heading-actions">
                 <button
                   className="small-button"
                   onClick={() => setShowAlternative((value) => !value)}
                 >
-                  {showAlternative
-                    ? "Show shortest route"
-                    : "Show alternate route"}
+                  {showAlternative ? "Hide baseline" : "Show baseline"}
+                </button>
+                <button
+                  className="small-button"
+                  onClick={() => setComparison(null)}
+                >
+                  Close
                 </button>
               </div>
             </div>
+
+            <div className="comparison-grid">
+              <div className="comparison-card shortest">
+                <span>
+                  {comparison.optimal_known ? "OPTIMAL TOUR" : "BEST KNOWN TOUR"}
+                </span>
+                <strong>
+                  {comparison.best_distance ?? "—"}
+                  <small> units</small>
+                </strong>
+                <p>
+                  {comparison.optimal_known
+                    ? "Proven optimal by exact search"
+                    : "Heuristic: exact search is infeasible at this size"}
+                </p>
+              </div>
+
+              <div className="comparison-card alternate">
+                <span>SAVED VS INPUT ORDER</span>
+                <strong>
+                  {comparison.savings_vs_input_order ?? 0}
+                  <small> units</small>
+                </strong>
+                <p>
+                  Baseline (FIFO):{" "}
+                  {comparison.alternative_distance ?? "—"} units
+                </p>
+              </div>
+
+              <div className="comparison-card recommendation">
+                <span>SEARCH SPACE FOR {comparison.stops_count} STOPS</span>
+                <strong>
+                  {formatCount(comparison.search_space.permutations)} orders
+                </strong>
+                <p>
+                  n! permutations · Held-Karp states:{" "}
+                  {formatCount(comparison.search_space.dp_states)}
+                </p>
+              </div>
+            </div>
+
+            <p className="comparison-recommendation">
+              {comparison.recommendation}
+            </p>
+
+            <div className="orders-table-wrap">
+              <table className="orders-table strategy-table">
+                <thead>
+                  <tr>
+                    <th>STRATEGY</th>
+                    <th>COMPLEXITY</th>
+                    <th>DISTANCE</th>
+                    <th>GAP</th>
+                    <th>TIME</th>
+                    <th>OPERATIONS</th>
+                    <th>VISIT ORDER</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {comparison.strategies.map((s) => {
+                    const isBest =
+                      s.distance !== null &&
+                      s.distance === comparison.best_distance;
+                    const selected = activeStrategy?.key === s.key;
+                    return (
+                      <tr
+                        key={s.key}
+                        className={
+                          selected ? "strategy-row selected" : "strategy-row"
+                        }
+                        onClick={() =>
+                          s.status === "ok" && setSelectedStrategy(s.key)
+                        }
+                        title={s.description}
+                      >
+                        <td>
+                          <strong className="strategy-name">{s.label}</strong>
+                          <small>{s.family}</small>
+                        </td>
+                        <td>
+                          <code>{s.complexity}</code>
+                        </td>
+                        <td>
+                          {s.status === "ok" ? (
+                            <span className={isBest ? "best-value" : ""}>
+                              {s.distance} units
+                            </span>
+                          ) : (
+                            <span className="muted-text">
+                              {s.status === "skipped"
+                                ? "Skipped: too large"
+                                : "No route"}
+                            </span>
+                          )}
+                        </td>
+                        <td>
+                          {s.gap_percent === null
+                            ? "—"
+                            : s.gap_percent === 0
+                              ? comparison.optimal_known
+                                ? "optimal"
+                                : "best"
+                              : `+${s.gap_percent}%`}
+                        </td>
+                        <td>{s.status === "ok" ? formatMs(s.time_ms) : "—"}</td>
+                        <td>
+                          {s.status === "ok"
+                            ? s.operations.toLocaleString()
+                            : "—"}
+                        </td>
+                        <td className="sequence-cell">
+                          {s.status === "ok" ? (
+                            <StopSequence stops={s.stop_sequence} />
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <p className="table-hint">
+              Click a strategy to draw its route on the map. The dashed line
+              is the unoptimised input-order baseline.
+            </p>
           </section>
         )}
+
+        <section className="panel comparison-panel">
+          <div className="panel-heading">
+            <div>
+              <div className="eyebrow">
+                SCALABILITY · {BENCHMARK_SIZES.join(" / ")} DELIVERY LOCATIONS
+              </div>
+              <h3>Why Optimal Routing Gets Hard</h3>
+            </div>
+            <button
+              className="small-button"
+              onClick={runBenchmark}
+              disabled={benchmarkLoading}
+            >
+              {benchmarkLoading ? "Running..." : "Run benchmark"}
+            </button>
+          </div>
+
+          {!benchmark && (
+            <p className="table-hint">
+              Generates random instances with {BENCHMARK_SIZES.join(", ")}{" "}
+              stops on an empty grid and solves each with every strategy.
+              Exact methods (brute force n!, Held-Karp 2ⁿ·n²) are skipped once
+              they become infeasible; heuristics keep scaling but lose the
+              optimality guarantee.
+            </p>
+          )}
+
+          {benchmark && (
+            <div className="orders-table-wrap">
+              <table className="orders-table strategy-table">
+                <thead>
+                  <tr>
+                    <th>STOPS</th>
+                    <th>PERMUTATIONS (n!)</th>
+                    <th>DP STATES</th>
+                    {benchmark[0]?.strategies.map((s) => (
+                      <th key={s.key}>{s.label.toUpperCase()}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {benchmark.map((row) => (
+                    <tr key={row.requested_stops}>
+                      <td>
+                        <strong className="order-id">{row.stops}</strong>
+                      </td>
+                      <td>{formatCount(row.search_space.permutations)}</td>
+                      <td>{formatCount(row.search_space.dp_states)}</td>
+                      {row.strategies.map((s) => (
+                        <td key={s.key}>
+                          {s.status === "ok" ? (
+                            <>
+                              <span
+                                className={
+                                  s.distance === row.best_distance
+                                    ? "best-value"
+                                    : ""
+                                }
+                              >
+                                {s.distance} u
+                                {s.gap_percent ? ` (+${s.gap_percent}%)` : ""}
+                              </span>
+                              <small>
+                                {formatMs(s.time_ms)} ·{" "}
+                                {s.operations.toLocaleString()} ops
+                              </small>
+                            </>
+                          ) : (
+                            <span className="muted-text">
+                              {s.status === "skipped" ? "infeasible" : "no route"}
+                            </span>
+                          )}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
 
         <section id="orders" className="panel orders-panel">
           <div className="panel-heading">
@@ -1089,17 +1399,17 @@ export default function RouteIQDashboard() {
                         </strong>
                       </td>
 
-                      <td>
-                        <div className="route-cell-text">
-                          <span>
-                            {order.origin.x},{order.origin.y}
-                          </span>
-                          <span className="route-arrow">→</span>
-                          <span>
-                            {order.destination.x},{order.destination.y}
-                          </span>
-                        </div>
-                        <small>{order.distance ?? "—"} units</small>
+                      <td className="route-column">
+                        <RoutePath order={order} />
+                        <small>
+                          {order.distance ?? "—"} units ·{" "}
+                          {(order.stop_sequence ?? order.stops ?? []).length}{" "}
+                          stop
+                          {(order.stop_sequence ?? order.stops ?? []).length ===
+                          1
+                            ? ""
+                            : "s"}
+                        </small>
                       </td>
 
                       <td>{order.payload} kg</td>
@@ -1226,5 +1536,47 @@ export default function RouteIQDashboard() {
         </footer>
       </section>
     </main>
+  );
+}
+
+// Origin → each stop in visiting order → destination
+function RoutePath({ order }: { order: Order }) {
+  const sequence = order.stop_sequence ?? order.stops ?? [];
+  return (
+    <div className="route-cell-text route-path">
+      <span className="route-node origin" title="Origin">
+        O ({order.origin.x},{order.origin.y})
+      </span>
+      {sequence.map((stop, i) => (
+        <span key={`${stop.x}-${stop.y}-${i}`} className="route-step">
+          <span className="route-arrow">→</span>
+          <span className="route-node stop" title={`Stop ${i + 1}`}>
+            {i + 1} ({stop.x},{stop.y})
+          </span>
+        </span>
+      ))}
+      <span className="route-step">
+        <span className="route-arrow">→</span>
+        <span className="route-node destination" title="Destination">
+          D ({order.destination.x},{order.destination.y})
+        </span>
+      </span>
+    </div>
+  );
+}
+
+function StopSequence({ stops }: { stops: Point[] }) {
+  if (stops.length === 0) return <span className="muted-text">Direct</span>;
+  return (
+    <div className="route-cell-text route-path">
+      {stops.map((stop, i) => (
+        <span key={`${stop.x}-${stop.y}-${i}`} className="route-step">
+          {i > 0 && <span className="route-arrow">→</span>}
+          <span className="route-node stop">
+            ({stop.x},{stop.y})
+          </span>
+        </span>
+      ))}
+    </div>
   );
 }

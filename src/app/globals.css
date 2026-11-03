@@ -1173,6 +1173,7 @@ button:disabled {
     flex-direction: column;
   }
 }
+
 /* ANALYTICS & PERFORMANCE */
 
 .analytics-section {
@@ -1488,6 +1489,7 @@ button:disabled {
     gap: 7px;
   }
 }
+
 .stop-cell {
   background-color: var(--blue, #3b82f6);
   color: white;
@@ -1517,4 +1519,105 @@ button:disabled {
 .route-animated-path {
   stroke-dasharray: 4, 1.5;
   animation: routeFlow 1.6s linear infinite;
+}
+
+/* DELIVERY QUEUE: FULL STOP SEQUENCE */
+
+.orders-table td.route-column {
+  white-space: normal;
+  min-width: 260px;
+  max-width: 420px;
+}
+
+.route-path {
+  flex-wrap: wrap;
+  row-gap: 5px;
+}
+
+.route-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.route-node {
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: #0c151b;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.route-node.origin {
+  color: var(--cyan);
+  border-color: #38bdf855;
+}
+
+.route-node.destination {
+  color: var(--red);
+  border-color: #ef444455;
+}
+
+.route-node.stop {
+  color: var(--amber);
+  border-color: #eab30855;
+}
+
+/* STRATEGY COMPARISON */
+
+.comparison-recommendation {
+  margin: 14px 0;
+  padding: 10px 12px;
+  border-left: 2px solid var(--green);
+  background: #0c151b;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.strategy-table td.sequence-cell {
+  white-space: normal;
+  min-width: 220px;
+}
+
+.strategy-row {
+  cursor: pointer;
+}
+
+.strategy-row.selected {
+  background: #10261f;
+}
+
+.strategy-name {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.strategy-table code {
+  color: var(--cyan);
+  font-size: 10px;
+}
+
+.best-value {
+  color: var(--green);
+  font-weight: 700;
+}
+
+.table-hint {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+@media print {
+
+  .orders-table td,
+  .orders-table td.route-column {
+    white-space: normal;
+  }
+
+  .orders-table-wrap {
+    overflow: visible;
+  }
 }
