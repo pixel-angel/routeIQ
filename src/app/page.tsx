@@ -86,6 +86,21 @@ function samePoint(a: Point, b: Point) {
   return a.x === b.x && a.y === b.y;
 }
 
+// Converts a sequential path of coordinates to SVG percentage coordinates (0-100)
+function pointsToSvgPath(
+  points: Point[],
+  gridSize: number = GRID_SIZE,
+): string {
+  if (!points || points.length === 0) return "";
+  return points
+    .map((pt) => {
+      const cx = ((pt.x + 0.5) / gridSize) * 100;
+      const cy = ((pt.y + 0.5) / gridSize) * 100;
+      return `${cx.toFixed(2)},${cy.toFixed(2)}`;
+    })
+    .join(" ");
+}
+
 export default function RouteIQDashboard() {
   const [data, setData] = useState<State>(initialState);
 
@@ -358,24 +373,34 @@ export default function RouteIQDashboard() {
     }
   }
 
-  const shortestPath = useMemo(() => {
-    const path =
-      comparison?.shortest_route ??
+  // Raw coordinate sequences for drawing continuous vector lines
+  const activeOrderRoute = useMemo(() => {
+    return (
       data.orders.find(
         (order) =>
           samePoint(order.origin, origin) &&
           samePoint(order.destination, destination) &&
           order.status !== "Delivered",
-      )?.route ??
-      [];
+      )?.route ?? []
+    );
+  }, [data.orders, origin, destination]);
 
-    return new Set(path.map(pointKey));
-  }, [comparison, data.orders, origin, destination]);
+  const rawShortestRoute = useMemo(() => {
+    return comparison?.shortest_route ?? activeOrderRoute;
+  }, [comparison, activeOrderRoute]);
 
-  const alternativePath = useMemo(
-    () => new Set((comparison?.alternative_route ?? []).map(pointKey)),
-    [comparison],
-  );
+  const rawAlternativeRoute = useMemo(() => {
+    return comparison?.alternative_route ?? [];
+  }, [comparison]);
+
+  // Set lookups for subtle background highlighting on individual cells
+  const shortestPath = useMemo(() => {
+    return new Set(rawShortestRoute.map(pointKey));
+  }, [rawShortestRoute]);
+
+  const alternativePath = useMemo(() => {
+    return new Set(rawAlternativeRoute.map(pointKey));
+  }, [rawAlternativeRoute]);
 
   const filteredOrders = useMemo(() => {
     return data.orders.filter((order) => {
@@ -642,7 +667,97 @@ export default function RouteIQDashboard() {
                 ))}
               </div>
 
-              <div className="route-grid">
+              {/* Grid cell matrix with relative positioning for SVG vector line alignment */}
+              <div className="route-grid" style={{ position: "relative" }}>
+                {/* SVG Route Line Overlay */}
+                <svg
+                  className="route-svg-overlay"
+                  viewBox="0 0 100 100"
+                  preserveAspectRatio="none"
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    width: "100%",
+                    height: "100%",
+                    pointerEvents: "none",
+                    zIndex: 15,
+                  }}
+                >
+                  <defs>
+                    <filter
+                      id="emeraldLineGlow"
+                      x="-20%"
+                      y="-20%"
+                      width="140%"
+                      height="140%"
+                    >
+                      <feDropShadow
+                        dx="0"
+                        dy="0"
+                        stdDeviation="0.8"
+                        floodColor="#10b981"
+                      />
+                    </filter>
+                    <filter
+                      id="amberLineGlow"
+                      x="-20%"
+                      y="-20%"
+                      width="140%"
+                      height="140%"
+                    >
+                      <feDropShadow
+                        dx="0"
+                        dy="0"
+                        stdDeviation="0.6"
+                        floodColor="#f59e0b"
+                      />
+                    </filter>
+                  </defs>
+
+                  {/* Alternative Route Polyline (Dashed Amber) */}
+                  {showAlternative && rawAlternativeRoute.length > 1 && (
+                    <polyline
+                      points={pointsToSvgPath(rawAlternativeRoute)}
+                      fill="none"
+                      stroke="#f59e0b"
+                      strokeWidth="1.2"
+                      strokeDasharray="2.5 1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      filter="url(#amberLineGlow)"
+                      opacity="0.85"
+                    />
+                  )}
+
+                  {/* Shortest Route Polyline: Outer Glow/Underline (Cyan) */}
+                  {rawShortestRoute.length > 1 && (
+                    <polyline
+                      points={pointsToSvgPath(rawShortestRoute)}
+                      fill="none"
+                      stroke="#06b6d4"
+                      strokeWidth="2.4"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      opacity="0.25"
+                    />
+                  )}
+
+                  {/* Shortest Route Polyline: Main Core Path (Emerald Green) */}
+                  {rawShortestRoute.length > 1 && (
+                    <polyline
+                      points={pointsToSvgPath(rawShortestRoute)}
+                      fill="none"
+                      stroke="#10b981"
+                      strokeWidth="1.3"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      filter="url(#emeraldLineGlow)"
+                      className="route-animated-path"
+                    />
+                  )}
+                </svg>
+
+                {/* Grid Cells */}
                 {Array.from({ length: GRID_SIZE }, (_, y) =>
                   Array.from({ length: GRID_SIZE }, (_, x) => {
                     const point = { x, y };
@@ -665,12 +780,7 @@ export default function RouteIQDashboard() {
                               ? "×"
                               : stopIdx !== -1
                                 ? (stopIdx + 1).toString()
-                                : showAlternative &&
-                                    alternativePath.has(pointKey(point))
-                                  ? "·"
-                                  : shortestPath.has(pointKey(point))
-                                    ? "·"
-                                    : ""}
+                                : ""}
                       </button>
                     );
                   }),
