@@ -73,7 +73,8 @@ ShortestPathTree dijkstra(Point start, const set<int>& blocked) {
     const int dy[] = {0, 0, -1, 1};
 
     while (!pq.empty()) {
-        auto [d, cur] = pq.top();
+        ll d = pq.top().first;
+        int cur = pq.top().second;
         pq.pop();
         if (d != t.dist[cur]) continue;
         Point p = cellPoint(cur);
